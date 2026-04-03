@@ -1,0 +1,44 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: customs_ai
+      POSTGRES_USER: customs_user
+      POSTGRES_PASSWORD: customs_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U customs_user -d customs_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - .env
+    environment:
+      # These override .env so the backend always reaches the compose DB
+      DATABASE_URL: postgresql+psycopg://customs_user:customs_pass@db:5432/customs_ai
+      TESSERACT_CMD: /usr/bin/tesseract
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

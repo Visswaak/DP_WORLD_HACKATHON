@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color: #f9f6ef;
+  background:
+    radial-gradient(circle at top left, rgba(255, 143, 60, 0.18), transparent 30%),
+    radial-gradient(circle at top right, rgba(126, 247, 197, 0.12), transparent 26%),
+    linear-gradient(160deg, #08111f 0%, #0d1a2d 52%, #12233c 100%);
+  font-family: "Trebuchet MS", sans-serif;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.glass {
+  background: rgba(8, 17, 31, 0.68);
+  backdrop-filter: blur(14px);
+}
