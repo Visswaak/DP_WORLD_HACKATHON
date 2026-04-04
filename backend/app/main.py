@@ -8,7 +8,6 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Resp
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app import cache
 from app import jobs as jobs_module
 from app.config import settings
 from app.database import init_db, save_analyses
@@ -24,10 +23,14 @@ from app.services.analysis import analyze_uploads
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_db()
-    await cache.warm_cache()          # loads PGA, ports, country rules, tariffs into memory
+    if not settings.database_url:
+        logger.warning(
+            "DATABASE_URL is not set — analyses will not be persisted. "
+            "Set DATABASE_URL in .env or your environment."
+        )
     if not settings.active_api_key:
         logger.warning(
-            "No LLM API key set (GEMINI_API_KEY or OPENAI_API_KEY) — "
+            "No LLM API key set (GROQ_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY) — "
             "LLM extraction and RAG retrieval are disabled. "
             "The system will use regex fallback extraction and deterministic summaries."
         )
@@ -79,7 +82,6 @@ async def analysis_exception_handler(_: Request, exc: AnalysisError) -> JSONResp
 async def health() -> dict[str, object]:
     return {
         "status": "ok",
-        "cache_warm": cache.is_warm(),
         "metrics": metrics.snapshot(),
     }
 
@@ -176,8 +178,3 @@ async def get_job(job_id: str) -> JobResponse:
     )
 
 
-@app.post("/api/cache/reload")
-async def reload_cache() -> dict[str, str]:
-    """Force-reload compliance cache from DB. Call after re-seeding tables."""
-    await cache.reload_cache()
-    return {"status": "ok"}

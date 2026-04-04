@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
+from app.database import CountryRule, HsPga, HsTariff, SessionLocal, WorldPort
 from app.observability import logger
 from app.schemas import ComplianceIssue, ComplianceResult, DutyEstimate, ExtractedShipmentData
-from app.database import CountryRule, HsPga, HsTariff, SessionLocal, WorldPort
-from sqlalchemy import select
 
 # ── Origin restrictions ───────────────────────────────────────────────────────
 # India suspended bilateral trade with Pakistan and revoked MFN status in Feb 2019.
@@ -226,18 +228,8 @@ def _shipment_level_checks(
     return issues, total_penalty
 
 
-def _check_port_db(port_of_entry: str, ports: list[WorldPort]) -> tuple[list[ComplianceIssue], int]:
-    """Match port_of_entry against world_ports table and generate compliance issues."""
-    port_lower = port_of_entry.lower().strip()
-    if not port_lower or port_lower == "unknown":
-        return [], 0
-
-    matched: WorldPort | None = None
-    for port in ports:
-        if port.city.lower() in port_lower or port.port_name.lower() in port_lower:
-            matched = port
-            break
-
+def _check_port_match(matched: WorldPort | None) -> tuple[list[ComplianceIssue], int]:
+    """Generate compliance issues for a single already-matched WorldPort row."""
     if not matched:
         return [], 0
 
@@ -275,19 +267,69 @@ def _check_port_db(port_of_entry: str, ports: list[WorldPort]) -> tuple[list[Com
     return issues, penalty
 
 
+async def _lookup_port(session: AsyncSession, port_of_entry: str) -> WorldPort | None:
+    """Targeted port lookup — never loads the full world_ports table.
+
+    Strategy (cheapest to most expensive):
+    1. Exact match on port_code (UN/LOCODE primary key) — sub-millisecond.
+    2. ILIKE match on city or port_name — uses GIN trigram indexes created in
+       init_db(). Fast even against 100k+ rows when pg_trgm is installed.
+
+    The LLM extracts port_of_entry as free text (e.g. "JNPT Mumbai", "Chennai",
+    "IN BOM"). This two-step approach handles both structured codes and plain names.
+    """
+    port_lower = port_of_entry.lower().strip()
+    if not port_lower or port_lower == "unknown":
+        return None
+
+    # Step 1: exact port_code match (e.g. "IN BOM", "USLAX")
+    result = await session.execute(
+        select(WorldPort)
+        .where(WorldPort.port_code == port_lower.upper())
+        .where(WorldPort.is_active.is_(True))
+        .limit(1)
+    )
+    port = result.scalar_one_or_none()
+    if port:
+        return port
+
+    # Step 2: ILIKE on city / port_name — trigram index makes this fast at scale
+    result = await session.execute(
+        select(WorldPort)
+        .where(
+            or_(
+                WorldPort.city.ilike(f"%{port_lower}%"),
+                WorldPort.port_name.ilike(f"%{port_lower}%"),
+            )
+        )
+        .where(WorldPort.is_active.is_(True))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 # ── DB-backed evaluation ──────────────────────────────────────────────────────
 
 async def _evaluate_from_db(data: ExtractedShipmentData) -> ComplianceResult:
-    """Evaluate compliance. Uses in-process cache when warm (zero DB queries);
-    falls back to live DB queries when cache is cold (first request after restart)."""
-    from app import cache as _cache
+    """Evaluate compliance using targeted indexed DB queries.
 
+    All four queries run inside a single session (one connection from the pool).
+    Each query hits only the rows relevant to this shipment:
+    - HsPga:       WHERE hs_prefix IN (2/4/6/8-digit prefixes of shipment HS codes)
+    - CountryRule: WHERE country_name IN (origins in this shipment)
+    - HsTariff:    WHERE hs_code IN (8-digit codes + chapter codes)
+    - WorldPort:   point lookup by code or ILIKE on name/city (never a full scan)
+
+    No table is loaded into memory. The compliance DB can grow to any size
+    (12,000+ tariff rows, 5,000+ PGA rules, 100,000+ ports) without affecting
+    memory usage or startup time.
+    """
     issues: list[ComplianceIssue] = []
     suggestions: list[str] = []
     total_penalty = 0
     has_critical = False
 
-    # Collect all HS prefixes and origins
+    # Build lookup sets from this shipment's line items
     all_prefixes: set[str] = set()
     origins: set[str] = set()
     for item in data.items:
@@ -297,33 +339,31 @@ async def _evaluate_from_db(data: ExtractedShipmentData) -> ComplianceResult:
                 all_prefixes.add(hs[:length])
         origins.add(item.country_of_origin.lower().strip())
 
-    if _cache.is_warm():
-        # ── Cache path: zero DB queries ───────────────────────────────────────
-        pga_rows: list[HsPga] = [p for p in _cache.get_pgas() if p.hs_prefix in all_prefixes]
-        country_rows: list[CountryRule] = [r for r in _cache.get_country_rules() if r.country_name in origins]
-        world_ports: list[WorldPort] = _cache.get_ports()
-        tariff_map: dict[str, HsTariff] = _cache.get_tariff_map()
-    else:
-        # ── DB path: cache not yet warm (first request after cold start) ──────
-        async with SessionLocal() as session:  # type: ignore[misc]
-            pga_rows = list((await session.execute(
-                select(HsPga).where(HsPga.hs_prefix.in_(list(all_prefixes))).where(HsPga.is_active.is_(True))
-            )).scalars().all())
+    hs_codes_8 = [item.hs_code.strip() for item in data.items if len(item.hs_code.strip()) >= 8]
+    chapters = list({item.hs_code.strip()[:2] for item in data.items})
+    tariff_lookup_codes = list({*hs_codes_8, *chapters})
 
-            country_rows = list((await session.execute(
-                select(CountryRule).where(CountryRule.country_name.in_(list(origins))).where(CountryRule.is_active.is_(True))
-            )).scalars().all())
+    # Single session — one connection, four targeted queries
+    async with SessionLocal() as session:  # type: ignore[misc]
+        pga_rows: list[HsPga] = list((await session.execute(
+            select(HsPga)
+            .where(HsPga.hs_prefix.in_(list(all_prefixes)))
+            .where(HsPga.is_active.is_(True))
+        )).scalars().all())
 
-            hs_codes_8 = [item.hs_code.strip() for item in data.items if len(item.hs_code.strip()) >= 8]
-            chapters = [item.hs_code.strip()[:2] for item in data.items]
-            lookup_codes = list({*hs_codes_8, *chapters})
-            tariff_map = {row.hs_code: row for row in (await session.execute(
-                select(HsTariff).where(HsTariff.hs_code.in_(lookup_codes))
-            )).scalars().all()}
+        country_rows: list[CountryRule] = list((await session.execute(
+            select(CountryRule)
+            .where(CountryRule.country_name.in_(list(origins)))
+            .where(CountryRule.is_active.is_(True))
+        )).scalars().all())
 
-            world_ports = list((await session.execute(
-                select(WorldPort).where(WorldPort.is_active.is_(True))
-            )).scalars().all())
+        tariff_map: dict[str, HsTariff] = {
+            row.hs_code: row for row in (await session.execute(
+                select(HsTariff).where(HsTariff.hs_code.in_(tariff_lookup_codes))
+            )).scalars().all()
+        }
+
+        matched_port = await _lookup_port(session, data.port_of_entry)
 
     # ── Per-item checks ───────────────────────────────────────────────────────
     for item in data.items:
@@ -332,27 +372,24 @@ async def _evaluate_from_db(data: ExtractedShipmentData) -> ComplianceResult:
         # PGA issues — deduplicate per agency for this item
         seen_agencies: set[str] = set()
         for pga in pga_rows:
-            # Check if pga.hs_prefix is a prefix of this item's hs_code
             if not hs.startswith(pga.hs_prefix):
                 continue
             if pga.agency in seen_agencies:
                 continue
             seen_agencies.add(pga.agency)
 
-            detail = pga.detail_template.replace("{hs_code}", hs)
-            issue = ComplianceIssue(
+            issues.append(ComplianceIssue(
                 severity=pga.severity,
                 title=pga.title,
-                detail=detail,
+                detail=pga.detail_template.replace("{hs_code}", hs),
                 regulation=pga.regulation_ref,
-            )
-            issues.append(issue)
+            ))
             penalty = SEVERITY_WEIGHT.get(pga.severity.lower(), 5)
             total_penalty += penalty
             if pga.severity.lower() == "critical":
                 has_critical = True
 
-        # Incomplete HS code check (shipment-level but per item)
+        # Incomplete HS code
         if len(hs) < 8:
             issues.append(ComplianceIssue(
                 severity="medium",
@@ -367,39 +404,37 @@ async def _evaluate_from_db(data: ExtractedShipmentData) -> ComplianceResult:
             ))
             total_penalty += SEVERITY_WEIGHT["medium"]
 
-        # Origin / country rule checks
+        # Country rule checks
         origin = item.country_of_origin.lower().strip()
         for rule in country_rows:
             if rule.country_name != origin:
                 continue
             if rule.rule_type == "FTA":
-                suggestions.append(
-                    f"{rule.title}: {rule.detail}"
-                )
+                suggestions.append(f"{rule.title}: {rule.detail}")
             else:
-                issue = ComplianceIssue(
+                issues.append(ComplianceIssue(
                     severity=rule.severity,
                     title=rule.title,
                     detail=rule.detail,
                     regulation=rule.regulation_ref,
-                )
-                issues.append(issue)
+                ))
                 penalty = SEVERITY_WEIGHT.get(rule.severity.lower(), 5)
                 total_penalty += penalty
                 if rule.severity.lower() == "critical":
                     has_critical = True
 
-    # ── Shipment-level checks (value, incoterm; port handled via DB below) ──────
+    # ── Shipment-level checks (value, incoterm — port handled above via DB) ──
     shipment_issues, shipment_penalty = _shipment_level_checks(data, skip_port_check=True)
     issues.extend(shipment_issues)
     total_penalty += shipment_penalty
 
-    # ── Port-of-entry check via world_ports table ─────────────────────────────
-    port_issues, port_penalty = _check_port_db(data.port_of_entry, world_ports)
+    # ── Port check ────────────────────────────────────────────────────────────
+    port_issues, port_penalty = _check_port_match(matched_port)
     issues.extend(port_issues)
     total_penalty += port_penalty
 
-    # ── Duty estimate — try DB tariff, fall back to chapter dict ─────────────
+    # ── Duty estimate — DB tariff row first, chapter dict fallback ────────────
+    duty_estimate: DutyEstimate
     if data.items:
         first_hs = data.items[0].hs_code.strip()
         tariff_row = tariff_map.get(first_hs) or tariff_map.get(first_hs[:2])

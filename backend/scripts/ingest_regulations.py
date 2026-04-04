@@ -5,14 +5,14 @@ Ingest regulation chunks into pgvector for RAG retrieval.
 Usage:
     cd backend
     source .venv/bin/activate
-    OPENAI_API_KEY=sk-... DATABASE_URL=postgresql+psycopg://... python scripts/ingest_regulations.py
+    GROQ_API_KEY=gsk-... (or GEMINI_API_KEY / OPENAI_API_KEY) DATABASE_URL=postgresql+psycopg://... python scripts/ingest_regulations.py
 
 The script is idempotent: it clears existing chunks before reinserting,
 so it can be re-run safely when the corpus changes.
 
 Requires:
     - DATABASE_URL pointing to a Postgres instance with pgvector installed
-    - OPENAI_API_KEY for generating embeddings
+    - GROQ_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY for generating embeddings
 """
 from __future__ import annotations
 
@@ -38,8 +38,8 @@ async def ingest() -> None:
         print("ERROR: DATABASE_URL is not set. Set it before running this script.")
         sys.exit(1)
 
-    if not settings.openai_api_key:
-        print("ERROR: OPENAI_API_KEY is not set. Embeddings require the OpenAI API.")
+    if not settings.active_api_key:
+        print("ERROR: No LLM API key set (GROQ_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY).")
         sys.exit(1)
 
     chunks = json.loads(CORPUS_PATH.read_text())

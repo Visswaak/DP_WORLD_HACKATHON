@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Search upward from this file to find .env (covers both local dev and monorepo layouts)
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent.parent / ".env")
 
 
 def _get_int(name: str, default: int) -> int:
@@ -11,7 +17,8 @@ def _get_int(name: str, default: int) -> int:
 class Settings:
     app_name = "Customs Clearance Copilot API"
     app_version = "0.2.0"
-    database_url = os.getenv("DATABASE_URL")
+    supabase_db_url = os.getenv("SUPABASE_DB_URL")
+    database_url = os.getenv("DATABASE_URL") or supabase_db_url
     openai_api_key = os.getenv("OPENAI_API_KEY")
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     groq_api_key = os.getenv("GROQ_API_KEY")

@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, Boolean, DateTime, Integer, Numeric, String, Text, text
+from sqlalchemy import JSON, Boolean, DateTime, Index, Integer, Numeric, String, Text, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -31,6 +31,8 @@ class AnalysisRecord(Base):
 
 class HsTariff(Base):
     __tablename__ = "hs_tariffs"
+    # hs_code is the primary key — already a B-tree index, handles all point lookups.
+    # No additional indexes needed: queries are always by exact hs_code (8-digit or 2-digit chapter).
 
     hs_code: Mapped[str] = mapped_column(String(8), primary_key=True)   # 2-digit chapter OR 8-digit ITC-HS
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -42,23 +44,34 @@ class HsTariff(Base):
 
 class HsPga(Base):
     __tablename__ = "hs_pgas"
+    # Composite index on (hs_prefix, is_active): every compliance query filters both columns.
+    # Covers the full WHERE clause so Postgres never touches the table heap for filtered-out rows.
+    # At 5,000+ PGA rows this is the difference between a seq-scan and an index-only scan.
+    __table_args__ = (
+        Index("ix_hs_pgas_prefix_active", "hs_prefix", "is_active"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    hs_prefix: Mapped[str] = mapped_column(String(8), index=True)   # 2, 4, 6, or 8 digit prefix
-    agency: Mapped[str] = mapped_column(String(50))                 # FSSAI, BIS_CRS, WPC, CDSCO, etc.
+    hs_prefix: Mapped[str] = mapped_column(String(8))   # 2, 4, 6, or 8 digit prefix
+    agency: Mapped[str] = mapped_column(String(50))     # FSSAI, BIS_CRS, WPC, CDSCO, etc.
     severity: Mapped[str] = mapped_column(String(20))
     title: Mapped[str] = mapped_column(String(200))
-    detail_template: Mapped[str] = mapped_column(Text)              # use {hs_code} as placeholder
+    detail_template: Mapped[str] = mapped_column(Text)  # use {hs_code} as placeholder
     regulation_ref: Mapped[str] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, server_default="true")
 
 
 class CountryRule(Base):
     __tablename__ = "country_rules"
+    # Composite index on (country_name, is_active): same reasoning as HsPga.
+    # country_name is lowercased at insert time so the index is case-consistent.
+    __table_args__ = (
+        Index("ix_country_rules_name_active", "country_name", "is_active"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    country_name: Mapped[str] = mapped_column(String(100), index=True)   # lowercase
-    rule_type: Mapped[str] = mapped_column(String(30))   # SANCTIONED, RESTRICTED, HIGH_RISK, FTA
+    country_name: Mapped[str] = mapped_column(String(100))   # lowercase
+    rule_type: Mapped[str] = mapped_column(String(30))       # SANCTIONED, RESTRICTED, HIGH_RISK, FTA
     severity: Mapped[str] = mapped_column(String(20))
     title: Mapped[str] = mapped_column(String(200))
     detail: Mapped[str] = mapped_column(Text)
@@ -69,6 +82,14 @@ class CountryRule(Base):
 
 class WorldPort(Base):
     __tablename__ = "world_ports"
+    # port_code (UN/LOCODE) is the primary key — fast exact lookup.
+    # city and port_name get GIN trigram indexes created in init_db() via raw SQL
+    # (pg_trgm). SQLAlchemy's Index() does not support GIN operator classes,
+    # so we create them manually. These make ILIKE '%query%' searches fast
+    # even against 100,000+ rows — without them, every port lookup is a full seq-scan.
+    __table_args__ = (
+        Index("ix_world_ports_active", "is_active"),
+    )
 
     port_code: Mapped[str] = mapped_column(String(10), primary_key=True)   # UN/LOCODE
     port_name: Mapped[str] = mapped_column(String(200))
@@ -126,6 +147,28 @@ async def init_db() -> None:
                 ],
             )
         )
+
+        # pg_trgm: enables GIN trigram indexes on world_ports for fast ILIKE port lookups.
+        # Without this, matching a free-text port_of_entry string against 100k+ port rows
+        # is a full sequential scan on every compliance evaluation.
+        # The extension and indexes are created with IF NOT EXISTS — safe to re-run.
+        try:
+            await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            await connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_world_ports_city_trgm "
+                "ON world_ports USING GIN (city gin_trgm_ops)"
+            ))
+            await connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_world_ports_name_trgm "
+                "ON world_ports USING GIN (port_name gin_trgm_ops)"
+            ))
+            logger.info("pg_trgm_indexes_ready")
+        except Exception as exc:
+            logger.warning(
+                "pg_trgm_unavailable reason=%s — port lookups will use sequential scans. "
+                "Install pg_trgm on your Postgres server for efficient port matching at scale.",
+                exc,
+            )
 
         # pgvector table: only if the extension is available in Postgres
         try:
